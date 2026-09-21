@@ -138,12 +138,7 @@ final class SpeechInput: ObservableObject {
                     }
                 }
                 if let error {
-                    let native = error as NSError
-                    var code = "\(native.domain) \(native.code)"
-                    if let cause = native.userInfo[NSUnderlyingErrorKey] as? NSError {
-                        code += "; \(cause.domain) \(cause.code)"
-                    }
-                    self.fail("Apple speech: \(native.localizedDescription) (\(code)).")
+                    self.handleRecognitionError(error as NSError, handsFree: self.handsFree)
                 } else if let result, result.isFinal {
                     self.stopAudio()
                     self.task = nil
@@ -257,6 +252,28 @@ final class SpeechInput: ObservableObject {
         transcript = text
         status = "Recognised — \(recognitionMode)."
         onFinal?(text)
+    }
+
+    // Keep an empty hands-free session alive after Apple's normal silence timeout.
+    // Never execute partial text or suppress unrelated recognition failures.
+    func handleRecognitionError(_ error: NSError, handsFree: Bool) {
+        if handsFree, transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           error.domain == "kAFAssistantErrorDomain", error.code == 1110 {
+            cancel()
+            status = "Still listening…"
+            let current = generation
+            sessionTask = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+                guard let self, self.generation == current else { return }
+                self.onIdle?()
+            }
+            return
+        }
+        var code = "\(error.domain) \(error.code)"
+        if let cause = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+            code += "; \(cause.domain) \(cause.code)"
+        }
+        fail("Apple speech: \(error.localizedDescription) (\(code)).")
     }
 
     private func fail(_ message: String) {
