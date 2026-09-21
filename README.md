@@ -15,7 +15,13 @@ open "$HOME/Applications/Desktop Voice.app"
 
 In setup: save your TypeSafe API key (stored in the Keychain), then allow Accessibility, microphone and speech.
 
-Hold **Control–Option–Space**, speak, release. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
+Hold **Control–Option–Space**, speak, release. Change this combination in **Settings → Choose your voice shortcut → Change shortcut**; press the key and any modifiers you want. Your choice is saved across launches. Escape cancels recording, and a conflicting shortcut leaves the previous choice in place. macOS-reserved combinations and modifier-only shortcuts are not supported. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
+
+## Hands-free widget
+
+Click **Start hands-free** in the widget. Speak a command and pause for about 1.5 seconds to submit it. The app waits for Apple's final transcript before acting, pauses its microphone while executing, then listens for your next command. Idle listening sessions renew automatically. Hands-free mode is off at launch.
+
+Click **Hands-free on · Stop**, press **Escape**, close the widget, or open Settings to stop hands-free use. A microphone, recognition, or command error also stops it and shows the problem. Apple Speech may process audio online, as with hold-to-talk.
 
 ## Examples
 
@@ -47,6 +53,7 @@ Everything is logged locally: `log show --predicate 'subsystem == "local.jev-use
 ## Develop
 
 ```sh
-swift test        # 10 tests
+swift test        # requires XCTest from full Xcode
+bash scripts/check-desktop.sh  # focused checks; Command Line Tools are sufficient
 bash build.sh     # quit the app first
 ```

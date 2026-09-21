@@ -17,7 +17,7 @@ struct JevDesktopApp: App {
             Button("Settings and commands…") { model.showSettings() }
             Button("Cancel current command") { model.cancel() }.disabled(!model.isBusy)
             Divider()
-            Text("Hold ⌃⌥Space to speak")
+            Text("Hold \(model.shortcut.label) to speak")
             Button("Quit Desktop Voice") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
         }
     }
@@ -39,7 +39,7 @@ final class AppModel: ObservableObject {
     static let shared = AppModel()
     private let log = Logger(subsystem: "local.jev-use", category: "status")
     @Published var headline = "Ready for a command" { didSet { log.notice("\(self.headline, privacy: .public) | \(self.detail, privacy: .public)") } }
-    @Published var detail = "Hold Control–Option–Space. Release to act. Escape cancels." { didSet { log.notice("  \(self.detail, privacy: .public)") } }
+    @Published var detail = "Hold \(KeyboardShortcut.load().label). Release to act. Escape cancels." { didSet { log.notice("  \(self.detail, privacy: .public)") } }
     /// The word the pixel field currently spells: the latest spoken word while the user speaks, otherwise nothing.
     @Published var word: String?
     @Published var transcript = ""
@@ -50,6 +50,13 @@ final class AppModel: ObservableObject {
     @Published var speechAllowed = false
     @Published var targetName = "your current app"
     @Published var timing = ""
+
+    @Published var shortcut = KeyboardShortcut.load()
+    @Published var recordingShortcut = false
+    @Published var shortcutMessage = ""
+    @Published var handsFree = false
+    @Published var handsFreePrompt = ""
+    private var shortcutMonitor: Any?
 
     let speech = SpeechInput()
     let systemAudio = SystemAudioMonitor()
@@ -122,10 +129,17 @@ final class AppModel: ObservableObject {
             }
             self.run(text, in: target, started: self.releasedAt ?? Date())
         }
+        speech.onIdle = { [weak self] in
+            guard let self, self.handsFree, !self.chainRunning else { return }
+            self.beginSpeech()
+        }
         speech.onFailure = { [weak self] message in self?.fail(message) }
-        hotKey.onPress = { [weak self] in self?.beginSpeech() }
+        hotKey.onPress = { [weak self] in
+            guard let self else { return }
+            if self.handsFree { self.showOverlay() } else { self.beginSpeech() }
+        }
         hotKey.onRelease = { [weak self] in
-            guard let self, self.capturing else { return }
+            guard let self, self.capturing, !self.handsFree else { return }
             self.releasedAt = Date()
             self.headline = "Finishing speech…"
             self.speech.finish()
@@ -157,7 +171,7 @@ final class AppModel: ObservableObject {
                 isLoadingKey = false
                 if shortcutReady {
                     headline = hasKey ? "Finish setup" : "Add your TypeSafe key"
-                    detail = "Complete setup, then hold ⌃⌥Space to speak."
+                    detail = "Complete setup, then hold \(shortcut.label) to speak."
                 }
                 openMainInterface()
             } catch {
@@ -206,7 +220,7 @@ final class AppModel: ObservableObject {
             let granted = await speech.requestPermissions()
             speechAllowed = speech.hasPermissions
             headline = granted ? "Speech is ready" : "Speech needs access"
-            detail = granted ? "Switch to an app, then hold Control–Option–Space." : speech.status
+            detail = granted ? "Switch to an app, then hold \(KeyboardShortcut.load().label)." : speech.status
         }
     }
 
@@ -229,8 +243,13 @@ final class AppModel: ObservableObject {
     }
 
     func beginSpeech() {
+        guard !recordingShortcut else { return }
+        let continuous = handsFree
+        let prompt = continuous && awaitingClarification ? headline : ""
         let chainRunning = self.chainRunning
         if chainRunning { speech.cancel() } else { cancel(showStatus: false) }
+        handsFree = continuous
+        handsFreePrompt = prompt
         guard let app = prepare() else { return }
         target = app
         settingsWindow?.orderOut(nil)
@@ -247,7 +266,7 @@ final class AppModel: ObservableObject {
         showOverlay()
         let current = generation
         let listening = Task {
-            do { try await speech.start() }
+            do { try await speech.start(handsFree: continuous) }
             catch is CancellationError {
                 guard generation == current else { return }
                 capturing = false
@@ -332,10 +351,13 @@ final class AppModel: ObservableObject {
         chainRunning = true
         task = Task {
             defer {
-                chainRunning = false
+                if generation == current { chainRunning = false }
                 if let (next, app) = pendingCommand, generation == current {
                     pendingCommand = nil
                     run(next, in: app, started: Date())
+                } else if generation == current, handsFree {
+                    task = nil
+                    beginSpeech()
                 }
             }
             var modelSeconds = 0.0
@@ -371,7 +393,7 @@ final class AppModel: ObservableObject {
                     app = Desktop.currentTarget(fallback: lastExternalApp) ?? app
                 }
                 headline = lastResult
-                detail = steps.count > 1 ? "Done: \(steps.count) steps. Hold ⌃⌥Space to speak again." : "Hold ⌃⌥Space to speak again. Escape closes."
+                detail = steps.count > 1 ? "Done: \(steps.count) steps. Hold \(shortcut.label) to speak again." : "Hold \(shortcut.label) to speak again. Escape closes."
                 timing = String(format: "%.2fs total · %.2fs plan · %.2fs decision · %d action%@", Date().timeIntervalSince(started), planSeconds, modelSeconds, actions, actions == 1 ? "" : "s")
                 } else {
                     // Default: one Jev request per cycle, jev-ultrafast style. Code owns sequencing; Jev picks operation and target.
@@ -380,7 +402,7 @@ final class AppModel: ObservableObject {
                     if case .completed(let result, let count) = outcome {
                         actions = count
                         headline = result
-                        detail = count > 1 ? "Done in \(count) actions. Hold ⌃⌥Space to speak again." : "Hold ⌃⌥Space to speak again. Escape closes."
+                        detail = count > 1 ? "Done in \(count) actions. Hold \(shortcut.label) to speak again." : "Hold \(shortcut.label) to speak again. Escape closes."
                     }
                     timing = String(format: "%.2fs total · %.2fs decision · %d action%@", Date().timeIntervalSince(started), modelSeconds, actions, actions == 1 ? "" : "s")
                 }
@@ -1130,6 +1152,8 @@ final class AppModel: ObservableObject {
     }
 
     func cancel(showStatus: Bool = true) {
+        handsFree = false
+        handsFreePrompt = ""
         generation = UUID()
         task?.cancel()
         task = nil
@@ -1147,6 +1171,8 @@ final class AppModel: ObservableObject {
     }
 
     private func fail(_ message: String) {
+        handsFree = false
+        speech.cancel()
         capturing = false
         isBusy = false
         headline = "Command stopped"
@@ -1156,6 +1182,7 @@ final class AppModel: ObservableObject {
     }
 
     func showSettings() {
+        if handsFree { cancel(showStatus: false) }
         refreshPermissions()
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 680),
@@ -1172,11 +1199,12 @@ final class AppModel: ObservableObject {
     }
 
     func showVoiceWidget() {
+        if recordingShortcut { finishShortcutRecording(nil) }
         refreshPermissions()
         settingsWindow?.orderOut(nil)
         if !isBusy {
             headline = setupComplete ? "Ready when you are" : "Finish setup to use voice"
-            detail = setupComplete ? "Hold ⌃⌥Space to speak. Release to act." : "Open Settings from the Desktop Voice menu bar icon."
+            detail = setupComplete ? "Hold \(shortcut.label) to speak. Release to act." : "Open Settings from the Desktop Voice menu bar icon."
             transcript = ""
             timing = ""
             wordTask?.cancel(); wordTask = nil
@@ -1193,7 +1221,7 @@ final class AppModel: ObservableObject {
 
     private func showOverlay() {
         if overlay == nil {
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 172),
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 202),
                                 styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             panel.level = .floating
             panel.isOpaque = false
@@ -1214,7 +1242,46 @@ final class AppModel: ObservableObject {
         overlay?.orderFrontRegardless()
     }
 
+    func toggleHandsFree() {
+        if handsFree { cancel(); return }
+        cancel(showStatus: false)
+        handsFree = true
+        beginSpeech()
+    }
+
+    func recordShortcut() {
+        cancel(showStatus: false)
+        hotKey.unregister()
+        recordingShortcut = true
+        shortcutMessage = "Press a combination. Escape cancels."
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if event.keyCode == 53 { self.finishShortcutRecording(nil) }
+                else { self.finishShortcutRecording(KeyboardShortcut(event: event)) }
+            }
+            return nil
+        }
+    }
+
+    func finishShortcutRecording(_ candidate: KeyboardShortcut?) {
+        if let shortcutMonitor { NSEvent.removeMonitor(shortcutMonitor) }
+        shortcutMonitor = nil
+        recordingShortcut = false
+        do {
+            try hotKey.register(candidate ?? shortcut)
+            if let candidate { shortcut = candidate; candidate.save() }
+            shortcutReady = true
+            shortcutMessage = candidate == nil ? "Shortcut unchanged." : "Shortcut saved."
+        } catch {
+            shortcutMessage = error.localizedDescription
+            do { try hotKey.register(shortcut); shortcutReady = true }
+            catch { shortcutReady = false; shortcutMessage += " Previous shortcut could not be restored: \(error.localizedDescription)" }
+        }
+    }
+
     func shutdown() {
+        if recordingShortcut { finishShortcutRecording(nil) }
         cancel(showStatus: false)
         keyTask?.cancel()
         systemAudio.stop()
@@ -1274,7 +1341,15 @@ private struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 8) {
-                Text("3. Hold ⌃⌥Space and speak").font(.headline)
+                Text("3. Choose your voice shortcut").font(.headline)
+                HStack {
+                    Text(model.shortcut.label).font(.body.monospaced())
+                    Button(model.recordingShortcut ? "Cancel recording" : "Change shortcut…") {
+                        if model.recordingShortcut { model.finishShortcutRecording(nil) } else { model.recordShortcut() }
+                    }
+                }
+                if !model.shortcutMessage.isEmpty { Text(model.shortcutMessage).font(.caption) }
+                Text("Hold the shortcut to speak. macOS-reserved combinations may be unavailable.").font(.caption)
                 Text("Release to act. Escape stops pending work.")
                 Text("Try “Open Desktop”, “Open Brave, go to google.com and type in hello”, or “Open Codex and type this: hello”.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -1298,6 +1373,12 @@ private struct SettingsView: View {
         }
         .padding(28)
         .frame(width: 540)
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
+            if let window = notification.object as? NSWindow, window.title == "Desktop Voice", model.recordingShortcut { model.finishShortcutRecording(nil) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            if model.recordingShortcut { model.finishShortcutRecording(nil) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refreshPermissions() }
     }
 }
@@ -1310,7 +1391,7 @@ private struct VoiceWidget: View {
     @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
 
     private var message: String {
-        if speech.isListening { return model.transcript.isEmpty ? "Listening…" : model.transcript }
+        if speech.isListening { return model.transcript.isEmpty ? (model.handsFreePrompt.isEmpty ? "Listening…" : model.handsFreePrompt) : model.transcript }
         return model.headline == "Command stopped" ? model.detail : model.headline
     }
 
@@ -1346,11 +1427,18 @@ private struct VoiceWidget: View {
                 Text(model.transcript).font(.system(size: 10)).foregroundStyle(.white.opacity(0.65))
                     .lineLimit(2).multilineTextAlignment(.center).help(model.transcript)
             }
-            Text("Hold ⌃⌥Space to speak")
+            Button { model.toggleHandsFree() } label: {
+                Label(model.handsFree ? "Hands-free on · Stop" : "Start hands-free", systemImage: model.handsFree ? "mic.fill" : "mic")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(model.handsFree ? Color.green : Color.white)
+            .help("Automatically submit after a pause. Escape stops hands-free mode.")
+            Text(model.handsFree ? "Pause to act · Esc to stop" : "Hold \(model.shortcut.label) to speak")
                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.45))
         }
         .padding(.horizontal, 14)
-        .frame(width: 244, height: 172)
+        .frame(width: 244, height: 202)
         .background {
             RoundedRectangle(cornerRadius: 22).fill(.ultraThinMaterial)
                 .overlay(RoundedRectangle(cornerRadius: 22).fill(Color.black.opacity(0.5)))
