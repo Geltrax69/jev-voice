@@ -56,6 +56,10 @@ final class AppModel: ObservableObject {
     @Published var shortcutMessage = ""
     @Published var handsFree = false
     @Published var handsFreePrompt = ""
+    @Published var waitingForWake = false
+    @Published var wakeWordEnabled = UserDefaults.standard.bool(forKey: "WakeWordEnabled") {
+        didSet { UserDefaults.standard.set(wakeWordEnabled, forKey: "WakeWordEnabled") }
+    }
     private var shortcutMonitor: Any?
 
     let speech = SpeechInput()
@@ -112,6 +116,7 @@ final class AppModel: ObservableObject {
         }
         speech.$transcript.sink { [weak self] text in
             guard let self, self.capturing else { return }
+            guard !self.waitingForWake else { return }
             self.transcript = text
             self.wordTask?.cancel(); self.wordTask = nil
             self.word = text.split(whereSeparator: \.isWhitespace).last.map(String.init)
@@ -120,8 +125,22 @@ final class AppModel: ObservableObject {
             if self?.capturing == true { self?.detail = status }
         }.store(in: &subscriptions)
         speech.onFinal = { [weak self] text in
-            guard let self, self.capturing, let target = self.target else { return }
+            guard let self, self.capturing, var target = self.target else { return }
+            var text = text
             self.capturing = false
+            if self.waitingForWake {
+                guard let command = WakePhrase.command(in: text, after: "Hey Jev") else {
+                    self.beginSpeech()
+                    return
+                }
+                self.waitingForWake = false
+                if command.isEmpty {
+                    self.beginSpeech()
+                    return
+                }
+                text = command
+                target = Desktop.currentTarget(fallback: self.lastExternalApp) ?? target
+            }
             if self.chainRunning {
                 self.pendingCommand = (text, target)
                 self.detail = "Queued: \(text)"
@@ -245,10 +264,12 @@ final class AppModel: ObservableObject {
     func beginSpeech() {
         guard !recordingShortcut else { return }
         let continuous = handsFree
+        let waiting = waitingForWake
         let prompt = continuous && awaitingClarification ? headline : ""
         let chainRunning = self.chainRunning
         if chainRunning { speech.cancel() } else { cancel(showStatus: false) }
         handsFree = continuous
+        waitingForWake = waiting
         handsFreePrompt = prompt
         guard let app = prepare() else { return }
         target = app
@@ -257,16 +278,18 @@ final class AppModel: ObservableObject {
         isBusy = true
         // Warm the connection, and ask a Chromium or Electron app for its web content, while the user is still speaking.
         // The result is not reused: a capture without the sentence lacks the apps and addresses the sentence names.
-        JevClient.warmUp()
-        Task { _ = try? await Desktop.capture(application: app, command: "", includeMenus: false) }
+        if !waitingForWake {
+            JevClient.warmUp()
+            Task { _ = try? await Desktop.capture(application: app, command: "", includeMenus: false) }
+        }
         transcript = ""
         timing = ""
         releasedAt = nil
-        headline = "Listening…"
+        headline = waitingForWake ? "Say “Hey Jev” to begin" : "Listening…"
         showOverlay()
         let current = generation
         let listening = Task {
-            do { try await speech.start(handsFree: continuous) }
+            do { try await speech.start(handsFree: continuous, wakePhrase: waiting ? "Hey Jev" : nil) }
             catch is CancellationError {
                 guard generation == current else { return }
                 capturing = false
@@ -1153,6 +1176,7 @@ final class AppModel: ObservableObject {
 
     func cancel(showStatus: Bool = true) {
         handsFree = false
+        waitingForWake = false
         handsFreePrompt = ""
         generation = UUID()
         task?.cancel()
@@ -1172,6 +1196,7 @@ final class AppModel: ObservableObject {
 
     private func fail(_ message: String) {
         handsFree = false
+        waitingForWake = false
         speech.cancel()
         capturing = false
         isBusy = false
@@ -1246,6 +1271,7 @@ final class AppModel: ObservableObject {
         if handsFree { cancel(); return }
         cancel(showStatus: false)
         handsFree = true
+        waitingForWake = wakeWordEnabled
         beginSpeech()
     }
 
@@ -1298,6 +1324,7 @@ private struct SettingsView: View {
     @State private var command = ""
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 22) {
             HStack(spacing: 12) {
                 Image(systemName: "waveform.circle.fill").font(.system(size: 38)).foregroundStyle(.teal)
@@ -1353,6 +1380,9 @@ private struct SettingsView: View {
                 Text("Release to act. Escape stops pending work.")
                 Text("Try “Open Desktop”, “Open Brave, go to google.com and type in hello”, or “Open Codex and type this: hello”.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("Start hands-free with “Hey Jev”", isOn: $model.wakeWordEnabled)
+                Text("Enable listening in the widget, then say “Hey Jev”. Hands-free stays on until you stop it. Apple Speech may process wake-word audio online.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Button("Done — use voice widget") { model.showVoiceWidget() }.disabled(!model.setupComplete)
             }
             Divider()
@@ -1372,7 +1402,8 @@ private struct SettingsView: View {
             }
         }
         .padding(28)
-        .frame(width: 540)
+        }
+        .frame(width: 540, height: min(760, (NSScreen.main?.visibleFrame.height ?? 840) - 80))
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
             if let window = notification.object as? NSWindow, window.title == "Desktop Voice", model.recordingShortcut { model.finishShortcutRecording(nil) }
         }
@@ -1391,6 +1422,7 @@ private struct VoiceWidget: View {
     @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
 
     private var message: String {
+        if model.waitingForWake { return "Say “Hey Jev” to begin" }
         if speech.isListening { return model.transcript.isEmpty ? (model.handsFreePrompt.isEmpty ? "Listening…" : model.handsFreePrompt) : model.transcript }
         return model.headline == "Command stopped" ? model.detail : model.headline
     }
@@ -1428,13 +1460,13 @@ private struct VoiceWidget: View {
                     .lineLimit(2).multilineTextAlignment(.center).help(model.transcript)
             }
             Button { model.toggleHandsFree() } label: {
-                Label(model.handsFree ? "Hands-free on · Stop" : "Start hands-free", systemImage: model.handsFree ? "mic.fill" : "mic")
+                Label(model.waitingForWake ? "Wake word on · Stop" : model.handsFree ? "Hands-free on · Stop" : model.wakeWordEnabled ? "Listen for “Hey Jev”" : "Start hands-free", systemImage: model.handsFree ? "mic.fill" : "mic")
                     .font(.system(size: 11, weight: .medium))
             }
             .buttonStyle(.plain)
             .foregroundStyle(model.handsFree ? Color.green : Color.white)
             .help("Automatically submit after a pause. Escape stops hands-free mode.")
-            Text(model.handsFree ? "Pause to act · Esc to stop" : "Hold \(model.shortcut.label) to speak")
+            Text(model.waitingForWake ? "Wake word listening · Esc to stop" : model.handsFree ? "Pause to act · Esc to stop" : "Hold \(model.shortcut.label) to speak")
                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.45))
         }
         .padding(.horizontal, 14)

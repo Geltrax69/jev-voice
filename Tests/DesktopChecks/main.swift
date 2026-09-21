@@ -29,6 +29,15 @@ struct DesktopChecks {
         speech.cancel()
         speech.finish()
         precondition(!speech.isListening && !delivered)
+        precondition(WakePhrase.command(in: "Hey Jev", after: "Hey Jev") == "")
+        precondition(WakePhrase.command(in: "HEY, JEV! Open Finder", after: "Hey Jev") == "Open Finder")
+        precondition(WakePhrase.command(in: "Hey Jev, type Hello, world!", after: "Hey Jev") == "type Hello, world!")
+        precondition(WakePhrase.command(in: "Hey Jev, type \"Hello!\"", after: "Hey Jev") == "type \"Hello!\"")
+        precondition(WakePhrase.command(in: "Hey Jevons open Finder", after: "Hey Jev") == nil)
+        precondition(WakePhrase.command(in: "Someone said Hey Jev", after: "Hey Jev") == nil)
+        precondition(WakePhrase.command(in: "Open Finder", after: "Hey Jev") == nil)
+        precondition(WakePhrase.command(in: "Hey", after: "Hey Jev") == nil)
+        precondition(WakePhrase.command(in: "Hey Jev", after: "") == nil)
         let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110)
         var restarts = 0
         var failures = 0

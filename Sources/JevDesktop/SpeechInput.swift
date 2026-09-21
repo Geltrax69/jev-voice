@@ -64,7 +64,7 @@ final class SpeechInput: ObservableObject {
         return true
     }
 
-    func start(handsFree: Bool = false) async throws {
+    func start(handsFree: Bool = false, wakePhrase: String? = nil) async throws {
         cancel()
         self.handsFree = handsFree
         let current = generation
@@ -97,6 +97,7 @@ final class SpeechInput: ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
+        if let wakePhrase { request.contextualStrings = [wakePhrase] }
         // Keep Apple's default language and choice of local or online processing.
         recognitionMode = "Apple speech (may use the internet)"
         self.request = request
