@@ -61,6 +61,8 @@ final class AppModel: ObservableObject {
     @Published var handsFree = false
     @Published var handsFreePrompt = ""
     @Published var waitingForWake = false
+    // Non-nil while the shortcut owns recognition; restore its previous wake mode afterward.
+    private var wakeModeAfterShortcut: Bool?
     @Published var wakeWordEnabled = UserDefaults.standard.bool(forKey: "WakeWordEnabled") {
         didSet {
             UserDefaults.standard.set(wakeWordEnabled, forKey: "WakeWordEnabled")
@@ -153,7 +155,17 @@ final class AppModel: ObservableObject {
                     return
                 }
                 text = command
-                target = Desktop.currentTarget(fallback: self.lastExternalApp) ?? target
+            }
+            if self.handsFree, self.wakeModeAfterShortcut == nil {
+                guard let currentTarget = Desktop.currentTarget(fallback: self.lastExternalApp) else {
+                    self.fail("Switch to the app you want to control, then try again.")
+                    return
+                }
+                target = currentTarget
+            }
+            if let waiting = self.wakeModeAfterShortcut {
+                self.waitingForWake = waiting
+                self.wakeModeAfterShortcut = nil
             }
             if self.chainRunning {
                 self.pendingCommand = (text, target)
@@ -169,10 +181,11 @@ final class AppModel: ObservableObject {
         speech.onFailure = { [weak self] message in self?.fail(message) }
         hotKey.onPress = { [weak self] in
             guard let self else { return }
-            if self.handsFree { self.showOverlay() } else { self.beginSpeech() }
+            if self.handsFree && self.chainRunning { self.showOverlay() }
+            else { self.beginSpeech(holdingShortcut: true) }
         }
         hotKey.onRelease = { [weak self] in
-            guard let self, self.capturing, !self.handsFree else { return }
+            guard let self, self.capturing, self.wakeModeAfterShortcut != nil else { return }
             self.releasedAt = Date()
             self.headline = "Finishing speech…"
             self.speech.finish()
@@ -276,15 +289,17 @@ final class AppModel: ObservableObject {
         return app
     }
 
-    func beginSpeech() {
+    func beginSpeech(holdingShortcut: Bool = false) {
         guard !recordingShortcut else { return }
         let continuous = handsFree
-        let waiting = waitingForWake
-        let prompt = continuous && awaitingClarification ? headline : ""
+        let resumeWake = holdingShortcut ? (wakeModeAfterShortcut ?? waitingForWake) : nil
+        let waiting = waitingForWake && !holdingShortcut
+        let prompt = continuous && awaitingClarification ? (handsFreePrompt.isEmpty ? headline : handsFreePrompt) : ""
         let chainRunning = self.chainRunning
         if chainRunning { speech.cancel() } else { cancel(showStatus: false) }
         handsFree = continuous
         waitingForWake = waiting
+        wakeModeAfterShortcut = resumeWake
         handsFreePrompt = prompt
         guard let app = prepare() else { return }
         target = app
@@ -304,9 +319,15 @@ final class AppModel: ObservableObject {
         if !waitingForWake { showOverlay() }
         let current = generation
         let listening = Task {
-            do { try await speech.start(handsFree: continuous, wakePhrase: waiting ? "Hey Jev" : nil) }
+            do { try await speech.start(handsFree: continuous && !holdingShortcut, wakePhrase: waiting ? "Hey Jev" : nil) }
             catch is CancellationError {
                 guard generation == current else { return }
+                if let waiting = wakeModeAfterShortcut, handsFree {
+                    waitingForWake = waiting
+                    beginSpeech()
+                    return
+                }
+                wakeModeAfterShortcut = nil
                 capturing = false
                 isBusy = false
                 headline = "Ready to try again"
@@ -386,6 +407,7 @@ final class AppModel: ObservableObject {
         // Context from an earlier command only helps when it answers a "which one" question; otherwise it misleads.
         if !awaitingClarification { priorCommand = nil; priorAction = nil }
         awaitingClarification = false
+        handsFreePrompt = ""
         chainRunning = true
         task = Task {
             defer {
@@ -1192,6 +1214,7 @@ final class AppModel: ObservableObject {
     func cancel(showStatus: Bool = true) {
         handsFree = false
         waitingForWake = false
+        wakeModeAfterShortcut = nil
         handsFreePrompt = ""
         generation = UUID()
         task?.cancel()
@@ -1212,6 +1235,7 @@ final class AppModel: ObservableObject {
     private func fail(_ message: String) {
         handsFree = false
         waitingForWake = false
+        wakeModeAfterShortcut = nil
         speech.cancel()
         capturing = false
         isBusy = false
@@ -1451,7 +1475,7 @@ private struct VoiceWidget: View {
     @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
 
     private var message: String {
-        if model.waitingForWake { return model.headline }
+        if model.waitingForWake { return model.handsFreePrompt.isEmpty ? model.headline : model.handsFreePrompt }
         if speech.isListening { return model.transcript.isEmpty ? (model.handsFreePrompt.isEmpty ? "Listening…" : model.handsFreePrompt) : model.transcript }
         return model.headline == "Command stopped" ? model.detail : model.headline
     }
