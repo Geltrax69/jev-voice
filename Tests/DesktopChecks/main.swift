@@ -38,6 +38,10 @@ struct DesktopChecks {
         precondition(WakePhrase.command(in: "Open Finder", after: "Hey Jev") == nil)
         precondition(WakePhrase.command(in: "Hey", after: "Hey Jev") == nil)
         precondition(WakePhrase.command(in: "Hey Jev", after: "") == nil)
+        precondition(WakePhrase.command(in: "Hey Jeff", after: "Hey Jev") == "")
+        precondition(WakePhrase.command(in: "Hey Jeff, open Finder", after: "Hey Jev") == "open Finder")
+        precondition(WakePhrase.command(in: "Hey Jefferson", after: "Hey Jev") == nil)
+        precondition(WakePhrase.command(in: "Hey Jeff", after: "Hey Sam") == nil)
         let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110)
         var restarts = 0
         var failures = 0

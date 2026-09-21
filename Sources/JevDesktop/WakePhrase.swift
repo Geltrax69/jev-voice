@@ -21,8 +21,13 @@ enum WakePhrase {
         }
         let expected = words(phrase)
         let spoken = words(utterance)
-        guard !expected.isEmpty, spoken.count >= expected.count,
-              zip(expected, spoken).allSatisfy({ $0.0.0 == $0.1.0 }) else { return nil }
+        guard !expected.isEmpty, spoken.count >= expected.count else { return nil }
+        let expectedWords = expected.map { $0.0 }
+        let spokenWords = Array(spoken.prefix(expected.count).map { $0.0 })
+        // Apple Speech transcribes the spoken product name as "Jeff" on some Macs.
+        // Keep this narrowly scoped; do not fuzzy-match arbitrary names or prefixes.
+        let recognizedVariant = expectedWords == ["hey", "jev"] && spokenWords == ["hey", "jeff"]
+        guard spokenWords == expectedWords || recognizedVariant else { return nil }
         let end = spoken[expected.count - 1].1.upperBound
         return String(utterance[end...].drop(while: { $0.isWhitespace || ",.:;!?—–-".contains($0) })).trimmingCharacters(in: .whitespacesAndNewlines)
     }
