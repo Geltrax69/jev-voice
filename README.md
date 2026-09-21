@@ -19,13 +19,15 @@ Hold **Control–Option–Space**, speak, release. Change this combination in **
 
 ## Hands-free widget
 
-Click **Start hands-free** in the widget. Speak a command and pause for about 1.5 seconds to submit it. The app waits for Apple's final transcript before acting, pauses its microphone while executing, then listens for your next command. Idle listening sessions renew automatically. Hands-free mode is off at launch.
+Click **Start hands-free** in the widget. Speak a command and pause for about 1.5 seconds to submit it. The app waits for Apple's final transcript before acting, pauses its microphone while executing, then listens for your next command. Idle listening sessions renew automatically. Ordinary hands-free mode is off at launch. If wake-word activation is enabled, background wake-word listening starts after setup is ready.
 
-Click **Hands-free on · Stop**, press **Escape**, close the widget, or open Settings to stop hands-free use. A microphone, recognition, or command error also stops it and shows the problem. Apple Speech may process audio online, as with hold-to-talk.
+Click **Hands-free on · Stop**, press **Escape**, or open Settings to stop the active hands-free session. With wake-word activation enabled, closing the widget or opening Settings returns to background wake-word listening. A microphone, recognition, or command error also stops it and shows the problem. Apple Speech may process audio online, as with hold-to-talk.
 
 ### Optional wake phrase
 
-Enable **Start hands-free with “Hey Jev”** in Settings, then click **Listen for “Hey Jev”** in the widget. Say “Hey Jev” on its own or followed by a command, such as “Hey Jev, open Finder”. Once activated, hands-free stays on until you stop it; you do not need to repeat the phrase for each command. Stop, Escape, closing the widget, or opening Settings turns all listening off. The preference is saved, but listening never starts automatically at launch.
+Enable **Invoke the widget by saying “Hey Jev”** in Settings. This immediately starts listening in the background while the app is running; no widget click is required. The saved option also starts wake-word listening after app launch once setup is ready.
+
+Say “Hey Jev” on its own or followed by a command, such as “Hey Jev, open Finder”. The widget appears when the phrase is recognized, and hands-free stays active until you stop it. Closing the widget or opening Settings returns to background wake-word listening. **Stop** or **Escape** pauses all listening; use **Resume wake-word listening** in the menu bar to resume. Turn the setting off to disable automatic wake-word activation.
 
 The phrase must begin the recognized utterance. Unrelated speech is discarded while waiting, without sending commands or screen context to Jev. Wake-word listening uses Apple Speech and may process audio online; it is not a dedicated offline wake-word engine.
 
