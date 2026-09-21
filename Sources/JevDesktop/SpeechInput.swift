@@ -12,7 +12,13 @@ final class SpeechInput: ObservableObject {
     @Published var status = ""
     @Published var audioLevel: Double = 0
     var onFinal: ((String) -> Void)?
+    var onIdle: (() -> Void)?
     var onFailure: ((String) -> Void)?
+
+    private var handsFree = false
+    private var silenceTask: Task<Void, Never>?
+    private var sessionTask: Task<Void, Never>?
+    private var finalTask: Task<Void, Never>?
 
     private let engine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer()
@@ -58,8 +64,9 @@ final class SpeechInput: ObservableObject {
         return true
     }
 
-    func start() async throws {
+    func start(handsFree: Bool = false, wakePhrase: String? = nil) async throws {
         cancel()
+        self.handsFree = handsFree
         let current = generation
         isStarting = true
         transcript = ""
@@ -90,6 +97,7 @@ final class SpeechInput: ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
+        if let wakePhrase { request.contextualStrings = [wakePhrase] }
         // Keep Apple's default language and choice of local or online processing.
         recognitionMode = "Apple speech (may use the internet)"
         self.request = request
@@ -116,20 +124,28 @@ final class SpeechInput: ObservableObject {
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == current else { return }
-                if let result { self.transcript = result.bestTranscription.formattedString }
-                if let error {
-                    let native = error as NSError
-                    var code = "\(native.domain) \(native.code)"
-                    if let cause = native.userInfo[NSUnderlyingErrorKey] as? NSError {
-                        code += "; \(cause.domain) \(cause.code)"
+                if let result {
+                    let text = result.bestTranscription.formattedString
+                    if text != self.transcript {
+                        self.transcript = text
+                        if self.handsFree, !text.isEmpty, !self.releaseRequested {
+                            self.silenceTask?.cancel()
+                            self.silenceTask = Task { [weak self] in
+                                do { try await Task.sleep(nanoseconds: 1_500_000_000) } catch { return }
+                                guard let self, self.generation == current else { return }
+                                self.finish()
+                            }
+                        }
                     }
-                    self.fail("Apple speech: \(native.localizedDescription) (\(code)).")
+                }
+                if let error {
+                    self.handleRecognitionError(error as NSError, handsFree: self.handsFree)
                 } else if let result, result.isFinal {
                     self.stopAudio()
                     self.task = nil
                     self.request = nil
                     self.pendingFinal = result.bestTranscription.formattedString
-                    if self.releaseRequested {
+                    if self.releaseRequested || self.handsFree {
                         self.deliverFinal()
                     } else {
                         self.status = "Speech complete. Release the shortcut to use this command."
@@ -143,6 +159,16 @@ final class SpeechInput: ObservableObject {
             try engine.start()
             isListening = true
             status = "Listening — \(recognitionMode)."
+            if handsFree {
+                sessionTask = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: 45_000_000_000) } catch { return }
+                    guard let self, self.generation == current, !self.releaseRequested else { return }
+                    if self.transcript.isEmpty {
+                        self.cancel()
+                        self.onIdle?()
+                    } else { self.finish() }
+                }
+            }
         } catch {
             cancel()
             status = error.localizedDescription
@@ -158,6 +184,13 @@ final class SpeechInput: ObservableObject {
         }
         guard !releaseRequested, request != nil || pendingFinal != nil else { return }
         releaseRequested = true
+        silenceTask?.cancel()
+        let current = generation
+        finalTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 8_000_000_000) } catch { return }
+            guard let self, self.generation == current else { return }
+            self.fail("Speech recognition did not finish. Please try again.")
+        }
         if pendingFinal != nil {
             deliverFinal()
         } else {
@@ -169,6 +202,9 @@ final class SpeechInput: ObservableObject {
     }
 
     func cancel() {
+        silenceTask?.cancel(); silenceTask = nil
+        sessionTask?.cancel(); sessionTask = nil
+        finalTask?.cancel(); finalTask = nil
         generation = UUID()
         isStarting = false
         stopAudio()
@@ -203,9 +239,13 @@ final class SpeechInput: ObservableObject {
         guard let final = pendingFinal else { return }
         let text = final.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
+            if handsFree { cancel(); onIdle?(); return }
             fail("No speech was recognised.")
             return
         }
+        silenceTask?.cancel(); silenceTask = nil
+        sessionTask?.cancel(); sessionTask = nil
+        finalTask?.cancel(); finalTask = nil
         generation = UUID()
         pendingFinal = nil
         task = nil
@@ -213,6 +253,28 @@ final class SpeechInput: ObservableObject {
         transcript = text
         status = "Recognised — \(recognitionMode)."
         onFinal?(text)
+    }
+
+    // Keep an empty hands-free session alive after Apple's normal silence timeout.
+    // Never execute partial text or suppress unrelated recognition failures.
+    func handleRecognitionError(_ error: NSError, handsFree: Bool) {
+        if handsFree, transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           error.domain == "kAFAssistantErrorDomain", error.code == 1110 {
+            cancel()
+            status = "Still listening…"
+            let current = generation
+            sessionTask = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+                guard let self, self.generation == current else { return }
+                self.onIdle?()
+            }
+            return
+        }
+        var code = "\(error.domain) \(error.code)"
+        if let cause = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+            code += "; \(cause.domain) \(cause.code)"
+        }
+        fail("Apple speech: \(error.localizedDescription) (\(code)).")
     }
 
     private func fail(_ message: String) {

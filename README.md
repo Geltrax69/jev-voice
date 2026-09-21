@@ -15,7 +15,21 @@ open "$HOME/Applications/Desktop Voice.app"
 
 In setup: save your TypeSafe API key (stored in the Keychain), then allow Accessibility, microphone and speech.
 
-Hold **Control–Option–Space**, speak, release. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
+Hold **Control–Option–Space**, speak, release. Change this combination in **Settings → Choose your voice shortcut → Change shortcut**; press the key and any modifiers you want. Your choice is saved across launches. Escape cancels recording, and a conflicting shortcut leaves the previous choice in place. macOS-reserved combinations and modifier-only shortcuts are not supported. **Escape** cancels. Or type a command in the widget, or from a shell: `scripts/say.sh "Open Finder"`.
+
+## Hands-free widget
+
+Click **Start hands-free** in the widget. Speak a command and pause for about 1.5 seconds to submit it. The app waits for Apple's final transcript before acting, pauses its microphone while executing, then listens for your next command. Idle listening sessions renew automatically. Ordinary hands-free mode is off at launch. If wake-word activation is enabled, background wake-word listening starts after setup is ready.
+
+Click **Hands-free on · Stop**, press **Escape**, or open Settings to stop the active hands-free session. With wake-word activation enabled, closing the widget or opening Settings returns to background wake-word listening. A microphone, recognition, or command error also stops it and shows the problem. Apple Speech may process audio online, as with hold-to-talk.
+
+### Optional wake phrase
+
+Enable **Invoke the widget by saying “Hey Jev”** in Settings. This immediately starts listening in the background while the app is running; no widget click is required. The saved option also starts wake-word listening after app launch once setup is ready.
+
+Say “Hey Jev” on its own or followed by a command, such as “Hey Jev, open Finder”. The widget appears when the phrase is recognized, and hands-free stays active until you stop it. Closing the widget or opening Settings returns to background wake-word listening. **Stop** or **Escape** pauses all listening; use **Resume wake-word listening** in the menu bar to resume. Turn the setting off to disable automatic wake-word activation.
+
+The phrase must begin the recognized utterance. Unrelated speech is discarded while waiting, without sending commands or screen context to Jev. Wake-word listening uses Apple Speech and may process audio online; it is not a dedicated offline wake-word engine.
 
 ## Examples
 
@@ -47,6 +61,7 @@ Everything is logged locally: `log show --predicate 'subsystem == "local.jev-use
 ## Develop
 
 ```sh
-swift test        # 10 tests
+swift test        # requires XCTest from full Xcode
+bash scripts/check-desktop.sh  # focused checks; Command Line Tools are sufficient
 bash build.sh     # quit the app first
 ```
