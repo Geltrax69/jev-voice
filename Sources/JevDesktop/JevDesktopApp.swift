@@ -138,8 +138,12 @@ final class AppModel: ObservableObject {
         speech.$transcript.sink { [weak self] text in
             guard let self, self.capturing else { return }
             guard !self.waitingForWake else {
-                if WakePhrase.command(in: text, after: "Hey Jev") != nil {
+                if let command = WakePhrase.command(in: text, after: "Hey Jev") {
                     self.headline = "Wake phrase heard…"
+                    if !command.isEmpty {
+                        self.transcript = command
+                        self.word = command.split(whereSeparator: \.isWhitespace).last.map(String.init)
+                    }
                     self.showOverlay()
                 }
                 return
@@ -1427,22 +1431,23 @@ final class AppModel: ObservableObject {
 
     private func showOverlay() {
         if overlay == nil {
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 244, height: 202),
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 104),
                                 styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.level = .floating
+            panel.level = .statusBar
             panel.isOpaque = false
             panel.backgroundColor = .clear
-            panel.hasShadow = true
+            panel.hasShadow = false
+            panel.ignoresMouseEvents = true
             panel.hidesOnDeactivate = false
             panel.becomesKeyOnlyIfNeeded = true
-            panel.isMovableByWindowBackground = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.isMovableByWindowBackground = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             panel.contentView = NSHostingView(rootView: VoiceWidget(model: self, speech: speech))
-            if !panel.setFrameUsingName("DesktopVoiceWidget", force: true), let screen = NSScreen.main {
-                panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - 122, y: screen.visibleFrame.minY + 36))
-            }
-            panel.setFrameAutosaveName("DesktopVoiceWidget")
             overlay = panel
+        }
+        if let screen = NSScreen.main ?? NSScreen.screens.first, let overlay {
+            overlay.setFrameOrigin(NSPoint(x: screen.frame.midX - overlay.frame.width / 2,
+                                           y: screen.visibleFrame.maxY - overlay.frame.height - 6))
         }
         systemAudio.start()
         overlay?.orderFrontRegardless()
@@ -1613,80 +1618,110 @@ private struct VoiceWidget: View {
     @ObservedObject var model: AppModel
     @ObservedObject var speech: SpeechInput
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
-    @State private var field = PixelField(count: 720, bounds: CGSize(width: 216, height: 78))
 
     private var message: String {
-        if model.waitingForWake { return model.handsFreePrompt.isEmpty ? model.headline : model.handsFreePrompt }
+        if model.waitingForWake, model.transcript.isEmpty { return model.handsFreePrompt.isEmpty ? model.headline : model.handsFreePrompt }
         if speech.isListening { return model.transcript.isEmpty ? (model.handsFreePrompt.isEmpty ? "Listening…" : model.handsFreePrompt) : model.transcript }
         return model.headline == "Command stopped" ? model.detail : model.headline
     }
 
+    private var isExpanded: Bool {
+        speech.isListening || model.isBusy || !model.transcript.isEmpty || model.headline == "Command stopped"
+    }
+
+    private var stateLabel: String {
+        if model.waitingForWake, model.transcript.isEmpty { return "Say “Hey Jev”" }
+        if speech.isListening { return model.transcript.isEmpty ? "Listening" : "Hearing you" }
+        if model.headline == "Command stopped" { return "Needs attention" }
+        if model.isBusy { return model.headline }
+        return "Jev ready"
+    }
+
+    private var stateColor: Color {
+        if model.headline == "Command stopped" { return .orange }
+        if speech.isListening { return Color(red: 0.39, green: 0.86, blue: 0.78) }
+        if model.isBusy { return Color(red: 0.47, green: 0.69, blue: 1) }
+        return .white.opacity(0.55)
+    }
+
     var body: some View {
-        VStack(spacing: 5) {
-            Group {
-                if reduceMotion {
-                    Text(model.word ?? "")
-                        .font(.system(size: 34, weight: .heavy)).foregroundStyle(.white)
-                        .minimumScaleFactor(0.3).lineLimit(1)
-                } else {
-                    TimelineView(.animation(minimumInterval: 1.0 / 60)) { timeline in
-                        Canvas { context, size in
-                            let music = model.systemAudio.levels
-                            if model.word == nil && !speech.isListening && music.isPlaying {
-                                field.equalise(music.bands, at: timeline.date.timeIntervalSinceReferenceDate)
-                            } else {
-                                field.spell(model.word)
-                            }
-                            field.step(to: timeline.date.timeIntervalSinceReferenceDate, level: speech.isListening ? speech.audioLevel : 0)
-                            field.draw(in: &context)
+        ZStack(alignment: .top) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(stateColor.opacity(0.16))
+                    Circle().stroke(stateColor.opacity(0.72), lineWidth: 1)
+                    Image(systemName: speech.isListening ? "waveform" : model.isBusy ? "sparkles" : "mic.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(stateColor)
+                        .symbolEffect(.variableColor.iterative, options: .repeating,
+                                      isActive: speech.isListening && !reduceMotion)
+                }
+                .frame(width: 30, height: 30)
+
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(message)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        HStack(spacing: 6) {
+                            Circle().fill(stateColor).frame(width: 5, height: 5)
+                            Text(stateLabel)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.58))
+                                .lineLimit(1)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-            }
-            .frame(width: 216, height: 78)
-            .accessibilityHidden(true)
-            Text(message)
-                .font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
-                .lineLimit(model.headline == "Command stopped" || model.headline.hasPrefix("Which one") ? 3 : 2)
-                .multilineTextAlignment(.center).help(message)
-            if !speech.isListening && !model.transcript.isEmpty {
-                Text(model.transcript).font(.system(size: 10)).foregroundStyle(.white.opacity(0.65))
-                    .lineLimit(2).multilineTextAlignment(.center).help(model.transcript)
-            }
-            Button { model.toggleHandsFree() } label: {
-                Label(model.waitingForWake ? "Wake word on · Stop" : model.handsFree ? "Hands-free on · Stop" : model.wakeWordEnabled ? "Listen for “Hey Jev”" : "Start hands-free", systemImage: model.handsFree ? "mic.fill" : "mic")
-                    .font(.system(size: 11, weight: .medium))
+
+                if speech.isListening {
+                    NotchWaveform(level: speech.audioLevel, reduceMotion: reduceMotion)
+                        .frame(width: 38, height: 24)
+                        .accessibilityHidden(true)
+                }
+
             }
             .buttonStyle(.plain)
-            .foregroundStyle(model.handsFree ? Color.green : Color.white)
-            .help("Automatically submit after a pause. Escape stops hands-free mode.")
-            Text(model.waitingForWake ? "Wake word listening · Esc to stop" : model.handsFree ? "Pause to act · Esc to stop" : "Hold \(model.shortcut.label) to speak")
-                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.45))
-        }
-        .padding(.horizontal, 14)
-        .frame(width: 244, height: 202)
-        .background {
-            RoundedRectangle(cornerRadius: 22).fill(.ultraThinMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 22).fill(Color.black.opacity(0.5)))
-                .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(.white.opacity(0.12), lineWidth: 1))
-        }
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: 2) {
-                Button { model.showSettings() } label: {
-                    Image(systemName: "gearshape").font(.system(size: 11)).frame(width: 24, height: 24)
-                }.accessibilityLabel("Settings and commands").help("Settings and commands")
-                Button { model.dismissWidget() } label: {
-                    Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)).frame(width: 24, height: 24)
-                }.accessibilityLabel("Close widget and cancel pending work").help("Close widget and cancel pending work")
+            .foregroundStyle(.white.opacity(0.62))
+            .padding(.horizontal, isExpanded ? 16 : 12)
+            .padding(.top, 8)
+            .padding(.bottom, isExpanded ? 10 : 8)
+            .frame(width: isExpanded ? 390 : 76, height: isExpanded ? 68 : 46)
+            .background {
+                UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 20,
+                                       bottomTrailingRadius: 20, topTrailingRadius: 10,
+                                       style: .continuous)
+                    .fill(.black)
+                    .shadow(color: .black.opacity(0.34), radius: 14, y: 7)
             }
-            .buttonStyle(.plain).foregroundStyle(.white.opacity(0.65))
-            .padding(8)
-            .opacity(isHovering ? 1 : 0)
-            .allowsHitTesting(isHovering)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.34, extraBounce: 0.08), value: isExpanded)
+            .contentShape(UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 20,
+                                                 bottomTrailingRadius: 20, topTrailingRadius: 10,
+                                                 style: .continuous))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(stateLabel): \(message)")
         }
-        .onHover { isHovering = $0 }
+        .frame(width: 420, height: 104, alignment: .top)
         .preferredColorScheme(.dark)
+    }
+}
+
+private struct NotchWaveform: View {
+    let level: Double
+    let reduceMotion: Bool
+    private let weights: [Double] = [0.38, 0.72, 1, 0.62, 0.44]
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 3) {
+            ForEach(Array(weights.enumerated()), id: \.offset) { _, weight in
+                Capsule()
+                    .fill(.white.opacity(0.88))
+                    .frame(width: 3, height: 5 + max(0.08, level) * 18 * weight)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: level)
     }
 }
 
