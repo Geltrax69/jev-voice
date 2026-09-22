@@ -31,6 +31,26 @@ Say “Hey Jev” on its own or followed by a command, such as “Hey Jev, open 
 
 The phrase must begin the recognized utterance. Unrelated speech is discarded while waiting, without sending commands or screen context to Jev. Wake-word listening uses Apple Speech and may process audio online; it is not a dedicated offline wake-word engine.
 
+## Real-time mode
+
+Real-time safe actions are enabled by default and can be changed in Settings. Apple Speech already produces partial transcripts; Desktop Voice waits until a partial remains unchanged across the configured stability window, asks Jev to choose from a restricted safe-or-WAIT action set, applies a 90% confidence gate, and can begin a reversible action before final speech arrives.
+
+```text
+Mic → Apple Speech partials → stable transcript → Jev closed choice
+    → code safety gate → macOS Accessibility action → verification → continue listening
+```
+
+Only opening/switching applications, opening complete sites or folders, and scrolling are eligible for speculative execution. Typing, clicks, menus, Return, sending, account changes, passwords, shell commands, and destructive actions wait for final speech. Completed early actions enter an utterance-scoped ledger so the final command continues without repeating them.
+
+Launch the installed app or exercise the dry-run partial simulator:
+
+```sh
+scripts/jev.sh --realtime
+scripts/jev.sh --simulate-partials "open notes and create a note"
+```
+
+The widget shows measured first-text, Jev, execution/verification, and total latency for early actions. Environment overrides are listed in `.env.example`. See `TESTING_REALTIME.md` for permission setup, acceptance commands, safety checks, and current limitations.
+
 ## Examples
 
 - "Open Obsidian, create a new note and type hello"
