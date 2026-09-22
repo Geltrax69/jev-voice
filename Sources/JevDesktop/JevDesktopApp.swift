@@ -61,6 +61,9 @@ final class AppModel: ObservableObject {
     @Published var handsFree = false
     @Published var handsFreePrompt = ""
     @Published var waitingForWake = false
+    @Published var realtimeEnabled: Bool = UserDefaults.standard.object(forKey: "RealtimeEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "RealtimeEnabled") {
+        didSet { UserDefaults.standard.set(realtimeEnabled, forKey: "RealtimeEnabled") }
+    }
     // Non-nil while the shortcut owns recognition; restore its previous wake mode afterward.
     private var wakeModeAfterShortcut: Bool?
     @Published var wakeWordEnabled = UserDefaults.standard.bool(forKey: "WakeWordEnabled") {
@@ -101,6 +104,14 @@ final class AppModel: ObservableObject {
     private var settingsWindow: NSWindow?
     private var overlay: NSPanel?
     private var shortcutReady = false
+    private let realtimeConfiguration = RealtimeConfiguration.environment()
+    private var partials = PartialTranscriptManager(configuration: RealtimeConfiguration.environment())
+    private var speculativeLedger = ExecutedActionLedger()
+    private var realtimeTask: Task<Void, Never>?
+    private var partialStabilityTask: Task<Void, Never>?
+    private var pendingRealtimeFinal: (String, NSRunningApplication, Date)?
+    private var speechStartedAt: TimeInterval?
+    private var firstPartialAt: TimeInterval?
 
     var setupComplete: Bool { hasKey && accessibilityAllowed && speechAllowed }
 
@@ -136,6 +147,7 @@ final class AppModel: ObservableObject {
             self.transcript = text
             self.wordTask?.cancel(); self.wordTask = nil
             self.word = text.split(whereSeparator: \.isWhitespace).last.map(String.init)
+            self.receivePartial(text)
         }.store(in: &subscriptions)
         speech.$status.sink { [weak self] status in
             if self?.capturing == true { self?.detail = status }
@@ -172,7 +184,14 @@ final class AppModel: ObservableObject {
                 self.detail = "Queued: \(text)"
                 return
             }
-            self.run(text, in: target, started: self.releasedAt ?? Date())
+            let started = self.releasedAt ?? Date()
+            self.partialStabilityTask?.cancel(); self.partialStabilityTask = nil
+            if self.realtimeTask != nil {
+                self.pendingRealtimeFinal = (text, target, started)
+                self.detail = "Finishing the safe action, then continuing…"
+                return
+            }
+            self.run(text, in: target, started: started, speculativeActions: self.speculativeLedger.actions)
         }
         speech.onIdle = { [weak self] in
             guard let self, self.handsFree, !self.chainRunning else { return }
@@ -314,6 +333,13 @@ final class AppModel: ObservableObject {
         }
         transcript = ""
         timing = ""
+        partials.reset()
+        speculativeLedger.reset()
+        realtimeTask?.cancel(); realtimeTask = nil
+        partialStabilityTask?.cancel(); partialStabilityTask = nil
+        pendingRealtimeFinal = nil
+        speechStartedAt = ProcessInfo.processInfo.systemUptime
+        firstPartialAt = nil
         releasedAt = nil
         headline = waitingForWake ? "Listening for “Hey Jev” in the background" : "Listening…"
         if !waitingForWake { showOverlay() }
@@ -392,9 +418,106 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func receivePartial(_ text: String) {
+        guard realtimeEnabled, realtimeConfiguration.enabled, capturing, !waitingForWake,
+              realtimeTask == nil, let app = target else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !text.isEmpty, firstPartialAt == nil { firstPartialAt = now }
+        let update = partials.update(text, at: now)
+        partialStabilityTask?.cancel(); partialStabilityTask = nil
+        guard let stable = update.stableTranscript else {
+            partialStabilityTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(self?.realtimeConfiguration.stabilityDuration ?? 0.25)) } catch { return }
+                guard let self, self.capturing, self.transcript == text else { return }
+                self.receivePartial(text)
+            }
+            return
+        }
+        guard partials.mayDecide(at: now) else { return }
+        headline = "Stable speech"
+        detail = stable
+        let began = speechStartedAt ?? now
+        realtimeTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.realtimeTask = nil
+                if let (final, target, started) = self.pendingRealtimeFinal {
+                    self.pendingRealtimeFinal = nil
+                    self.run(final, in: target, started: started, speculativeActions: self.speculativeLedger.actions)
+                }
+            }
+            await self.speculate(stable, in: app, speechBegan: began)
+        }
+    }
+
+    /// Ask Jev for one action from a deliberately small safe-or-WAIT choice set.
+    private func speculate(_ stable: String, in app: NSRunningApplication, speechBegan: TimeInterval) async {
+        do {
+            guard let key, capturing else { return }
+            headline = "Deciding early…"
+            let capturedAt = ProcessInfo.processInfo.systemUptime
+            let snapshot = try await Desktop.capture(application: app, command: stable, includeMenus: false)
+            let apps = snapshot.candidates(of: [.app])
+            let sites = snapshot.candidates(of: [.website])
+            let folders = snapshot.candidates(of: [.folder])
+            var operations = ["WAIT": "The partial command is incomplete or not yet safe to act on."]
+            var heads: [String: [String: String]] = [:]
+            if !apps.isEmpty { operations["OPEN_APP"] = "Open or switch to the named application."; heads["app_target"] = Dictionary(uniqueKeysWithValues: apps.map { ($0.id, $0.detail) }) }
+            if !sites.isEmpty { operations["OPEN_URL"] = "Open the complete web address named in the partial command."; heads["url_target"] = Dictionary(uniqueKeysWithValues: sites.map { ($0.id, $0.detail) }) }
+            if !folders.isEmpty { operations["OPEN_FOLDER"] = "Open the named folder."; heads["folder_target"] = Dictionary(uniqueKeysWithValues: folders.map { ($0.id, $0.detail) }) }
+            operations["SCROLL_DOWN"] = "Scroll down one screen only when the partial command clearly asks for it."
+            operations["SCROLL_UP"] = "Scroll up one screen only when the partial command clearly asks for it."
+            let available = JevClient.Available(apps: apps.map(\.label), folders: folders.map(\.label), sites: sites.map(\.label), menus: [])
+            let state = JevClient.CycleState(goal: stable, dictation: nil, application: app.localizedName ?? "Unknown", window: snapshot.windowTitle,
+                                             elements: [], available: available, recentActions: speculativeLedger.actions.map {
+                JevClient.RecentAction(action: $0.id, result: $0.result, screenChanged: true)
+            }, previous: nil, count: nil, otherWindows: nil)
+            let decisionBegan = ProcessInfo.processInfo.systemUptime
+            let decision = try await JevClient.cycle(state: state, operations: operations, heads: heads, apiKey: key)
+            guard capturing, let operation = decision.choice("operation"), operation.id != "WAIT" else { return }
+            let head = ["OPEN_APP": "app_target", "OPEN_URL": "url_target", "OPEN_FOLDER": "folder_target"][operation.id]
+            let targetChoice = head.flatMap { decision.choice($0) }
+            let candidate = targetChoice.flatMap { selected in snapshot.candidates.first { $0.id == selected.id } }
+            let confidence = min(operation.confidence, operation.probability, targetChoice?.confidence ?? 1, targetChoice?.probability ?? 1)
+            guard RealtimeSafetyPolicy.allowsSpeculation(operation: operation.id, target: candidate?.label,
+                                                         transcript: stable, confidence: confidence,
+                                                         configuration: realtimeConfiguration) else {
+                headline = "Continuing to listen…"
+                detail = "Early \(operation.id.lowercased()) held by the safety gate (\(Int(confidence * 100))%)."
+                return
+            }
+            let identity = ExecutedActionLedger.identity(operation: operation.id, target: candidate?.label)
+            guard !speculativeLedger.contains(identity) else { return }
+            headline = candidate?.label ?? operation.id.replacingOccurrences(of: "_", with: " ").capitalized
+            detail = "Executing safe early action · Jev \(Int(confidence * 100))%"
+            let executionBegan = ProcessInfo.processInfo.systemUptime
+            let result: String
+            switch operation.id {
+            case "OPEN_APP", "OPEN_URL", "OPEN_FOLDER":
+                guard let candidate else { return }
+                result = try await Desktop.perform(candidate, snapshot: snapshot)
+            case "SCROLL_DOWN": result = try await Desktop.scroll(down: true, times: 1, in: app)
+            case "SCROLL_UP": result = try await Desktop.scroll(down: false, times: 1, in: app)
+            default: return
+            }
+            let finished = ProcessInfo.processInfo.systemUptime
+            _ = speculativeLedger.record(id: identity, transcriptSpan: stable, timestamp: finished, result: result)
+            let stt = (firstPartialAt ?? capturedAt) - speechBegan
+            let decisionTime = executionBegan - decisionBegan
+            let execution = finished - executionBegan
+            timing = String(format: "%.0fms first text · %.0fms Jev · %.0fms execute · %.0fms total", stt * 1_000, decisionTime * 1_000, execution * 1_000, (finished - speechBegan) * 1_000)
+            headline = "Verified early"
+            detail = result + " · continuing to listen"
+        } catch is CancellationError {
+        } catch {
+            log.notice("Realtime decision held: \(error.localizedDescription, privacy: .public)")
+            if capturing { headline = "Continuing to listen…"; detail = "Realtime attempt stopped safely: \(error.localizedDescription)" }
+        }
+    }
+
     private enum StepOutcome { case completed(result: String, actions: Int), stopped }
 
-    private func run(_ command: String, in first: NSRunningApplication, started: Date) {
+    private func run(_ command: String, in first: NSRunningApplication, started: Date, speculativeActions: [ExecutedAction] = []) {
         task?.cancel()
         generation = UUID()
         let current = generation
@@ -432,7 +555,12 @@ final class AppModel: ObservableObject {
                 // The first screen capture does not depend on the plan; run both at once.
                 async let warm = try? Desktop.capture(application: first, command: command)
                 let planned = try await Planner.plan(utterance: command, frontApp: first.localizedName ?? "Unknown", runningApps: running, apiKey: plannerKey)
-                let steps = planned.steps
+                let completed = Set(speculativeActions.map(\.id))
+                let steps = planned.steps.filter { step in
+                    let operation: String
+                    switch step.kind { case .openApp: operation = "OPEN_APP"; case .openURL: operation = "OPEN_URL"; case .openFolder: operation = "OPEN_FOLDER"; case .scroll: operation = step.target?.lowercased().hasPrefix("u") == true ? "SCROLL_UP" : "SCROLL_DOWN"; default: return true }
+                    return !completed.contains(ExecutedActionLedger.identity(operation: operation, target: step.target.map { step.kind == .openApp ? "Open \($0)" : $0 }))
+                }
                 let planSeconds = Date().timeIntervalSince(beganPlan)
                 try Task.checkCancellation()
                 guard generation == current else { return }
@@ -457,7 +585,7 @@ final class AppModel: ObservableObject {
                 timing = String(format: "%.2fs total · %.2fs plan · %.2fs decision · %d action%@", Date().timeIntervalSince(started), planSeconds, modelSeconds, actions, actions == 1 ? "" : "s")
                 } else {
                     // Default: one Jev request per cycle, jev-ultrafast style. Code owns sequencing; Jev picks operation and target.
-                    let outcome = try await runCycles(command, app: first, generation: current, modelSeconds: &modelSeconds)
+                    let outcome = try await runCycles(command, app: first, generation: current, modelSeconds: &modelSeconds, speculativeActions: speculativeActions)
                     guard generation == current else { return }
                     if case .completed(let result, let count) = outcome {
                         actions = count
@@ -610,14 +738,17 @@ final class AppModel: ObservableObject {
 
     /// jev-ultrafast style loop: every cycle sends the current element table, the goal, the dictation and recent actions,
     /// and asks Jev for one operation plus speculative targets in a single request. Code executes and checks freshness.
-    private func runCycles(_ goal: String, app first: NSRunningApplication, generation current: UUID, modelSeconds: inout Double) async throws -> StepOutcome {
+    private func runCycles(_ goal: String, app first: NSRunningApplication, generation current: UUID, modelSeconds: inout Double,
+                           speculativeActions: [ExecutedAction] = []) async throws -> StepOutcome {
         func name(_ app: NSRunningApplication) -> String { app.localizedName ?? "the app" }
         var app = first
         let input = CommandInput(goal)
         // The text to type is chosen by Jev as a first and a last word of the sentence (select, do not generate). The regex
         // splitter only understood "type this: X" and typed "teal into the colour field" for "Type teal into the colour field".
         let dictation: String? = nil
-        var recent: [JevClient.RecentAction] = []
+        var recent: [JevClient.RecentAction] = speculativeActions.map {
+            JevClient.RecentAction(action: $0.id, result: "Already completed from stable partial speech: \($0.result)", screenChanged: true)
+        }
         var noChange = 0
         var lastResult = "Done"
         var ineffective = Set<String>()
@@ -1219,6 +1350,11 @@ final class AppModel: ObservableObject {
         generation = UUID()
         task?.cancel()
         task = nil
+        realtimeTask?.cancel()
+        realtimeTask = nil
+        partialStabilityTask?.cancel()
+        partialStabilityTask = nil
+        pendingRealtimeFinal = nil
         chainRunning = false
         pendingCommand = nil
         capturing = false
@@ -1236,6 +1372,9 @@ final class AppModel: ObservableObject {
         handsFree = false
         waitingForWake = false
         wakeModeAfterShortcut = nil
+        realtimeTask?.cancel(); realtimeTask = nil
+        partialStabilityTask?.cancel(); partialStabilityTask = nil
+        pendingRealtimeFinal = nil
         speech.cancel()
         capturing = false
         isBusy = false
@@ -1435,6 +1574,9 @@ private struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Invoke the widget by saying “Hey Jev”", isOn: $model.wakeWordEnabled)
                 Text("When enabled, listens in the background while the app is running, including after launch. Say “Hey Jev” to open the widget and start hands-free. Closing the widget returns to wake-word listening; Stop or Escape pauses all listening. Apple Speech may process audio online.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Real-time safe actions", isOn: $model.realtimeEnabled)
+                Text("Stable partial speech may open apps, sites or folders, or scroll before you finish. Typing, Return, sending and destructive actions always wait for final speech.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Done — use voice widget") { model.showVoiceWidget() }.disabled(!model.setupComplete)
             }
